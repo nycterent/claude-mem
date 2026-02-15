@@ -15,8 +15,7 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from '
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { logger } from '../../utils/logger.js';
-import { getWorkerPort } from '../../shared/worker-utils.js';
-import { DATA_DIR, MARKETPLACE_ROOT, CLAUDE_CONFIG_DIR } from '../../shared/paths.js';
+import { getWorkerPort, getWorkerHost } from '../../shared/worker-utils.js';
 import {
   readCursorRegistry as readCursorRegistryFromFile,
   writeCursorRegistry as writeCursorRegistryToFile,
@@ -28,6 +27,7 @@ import type { CursorInstallTarget, CursorHooksJson, CursorMcpConfig, Platform } 
 const execAsync = promisify(exec);
 
 // Standard paths
+const DATA_DIR = path.join(homedir(), '.claude-mem');
 const CURSOR_REGISTRY_FILE = path.join(DATA_DIR, 'cursor-projects.json');
 
 // ============================================================================
@@ -128,12 +128,12 @@ export async function updateCursorContextForProject(projectName: string, port: n
 /**
  * Find cursor-hooks directory
  * Searches in order: marketplace install, source repo
- * Checks for hooks.json (unified CLI mode) or legacy shell scripts
+ * Checks for both bash (common.sh) and PowerShell (common.ps1) scripts
  */
 export function findCursorHooksDir(): string | null {
   const possiblePaths = [
     // Marketplace install location
-    path.join(MARKETPLACE_ROOT, 'cursor-hooks'),
+    path.join(homedir(), '.claude', 'plugins', 'marketplaces', 'thedotmack', 'cursor-hooks'),
     // Development/source location (relative to built worker-service.cjs in plugin/scripts/)
     path.join(path.dirname(__filename), '..', '..', 'cursor-hooks'),
     // Alternative dev location
@@ -141,10 +141,8 @@ export function findCursorHooksDir(): string | null {
   ];
 
   for (const p of possiblePaths) {
-    // Check for hooks.json (unified CLI mode) or legacy shell scripts
-    if (existsSync(path.join(p, 'hooks.json')) ||
-        existsSync(path.join(p, 'common.sh')) ||
-        existsSync(path.join(p, 'common.ps1'))) {
+    // Check for either bash or PowerShell common script
+    if (existsSync(path.join(p, 'common.sh')) || existsSync(path.join(p, 'common.ps1'))) {
       return p;
     }
   }
@@ -158,7 +156,7 @@ export function findCursorHooksDir(): string | null {
 export function findMcpServerPath(): string | null {
   const possiblePaths = [
     // Marketplace install location
-    path.join(MARKETPLACE_ROOT, 'plugin', 'scripts', 'mcp-server.cjs'),
+    path.join(homedir(), '.claude', 'plugins', 'marketplaces', 'thedotmack', 'plugin', 'scripts', 'mcp-server.cjs'),
     // Development/source location (relative to built worker-service.cjs in plugin/scripts/)
     path.join(path.dirname(__filename), 'mcp-server.cjs'),
     // Alternative dev location
@@ -180,7 +178,7 @@ export function findMcpServerPath(): string | null {
 export function findWorkerServicePath(): string | null {
   const possiblePaths = [
     // Marketplace install location
-    path.join(MARKETPLACE_ROOT, 'plugin', 'scripts', 'worker-service.cjs'),
+    path.join(homedir(), '.claude', 'plugins', 'marketplaces', 'thedotmack', 'plugin', 'scripts', 'worker-service.cjs'),
     // Development/source location (relative to built worker-service.cjs in plugin/scripts/)
     path.join(path.dirname(__filename), 'worker-service.cjs'),
     // Alternative dev location
@@ -193,37 +191,6 @@ export function findWorkerServicePath(): string | null {
     }
   }
   return null;
-}
-
-/**
- * Find the Bun executable path
- * Required because worker-service.cjs uses bun:sqlite which is Bun-specific
- * Searches common installation locations across platforms
- */
-export function findBunPath(): string {
-  const possiblePaths = [
-    // Standard user install location (most common)
-    path.join(homedir(), '.bun', 'bin', 'bun'),
-    // Global install locations
-    '/usr/local/bin/bun',
-    '/usr/bin/bun',
-    // Windows locations
-    ...(process.platform === 'win32' ? [
-      path.join(homedir(), '.bun', 'bin', 'bun.exe'),
-      path.join(process.env.LOCALAPPDATA || '', 'bun', 'bun.exe'),
-    ] : []),
-  ];
-
-  for (const p of possiblePaths) {
-    if (p && existsSync(p)) {
-      return p;
-    }
-  }
-
-  // Fallback to 'bun' and hope it's in PATH
-  // This allows the installation to proceed even if we can't find bun
-  // The user will get a clear error when the hook runs if bun isn't available
-  return 'bun';
 }
 
 /**
@@ -345,20 +312,14 @@ export async function installCursorHooks(_sourceDir: string, target: CursorInsta
     // Generate hooks.json with unified CLI commands
     const hooksJsonPath = path.join(targetDir, 'hooks.json');
 
-    // Find bun executable - required because worker-service.cjs uses bun:sqlite
-    const bunPath = findBunPath();
-    const escapedBunPath = bunPath.replace(/\\/g, '\\\\');
-
     // Use the absolute path to worker-service.cjs
     // Escape backslashes for JSON on Windows
     const escapedWorkerPath = workerServicePath.replace(/\\/g, '\\\\');
 
-    // Helper to create hook command using unified CLI with bun runtime
+    // Helper to create hook command using unified CLI
     const makeHookCommand = (command: string) => {
-      return `"${escapedBunPath}" "${escapedWorkerPath}" hook cursor ${command}`;
+      return `node "${escapedWorkerPath}" hook cursor ${command}`;
     };
-
-    console.log(`  Using Bun runtime: ${bunPath}`);
 
     const hooksJson: CursorHooksJson = {
       version: 1,
@@ -395,7 +356,7 @@ export async function installCursorHooks(_sourceDir: string, target: CursorInsta
 Installation complete!
 
 Hooks installed to: ${targetDir}/hooks.json
-Using unified CLI: bun worker-service.cjs hook cursor <command>
+Using unified CLI: node worker-service.cjs hook cursor <command>
 
 Next steps:
   1. Start claude-mem worker: claude-mem start
@@ -432,11 +393,12 @@ async function setupProjectContext(targetDir: string, workspaceRoot: string): Pr
 
   try {
     // Check if worker is running
-    const healthResponse = await fetch(`http://127.0.0.1:${port}/api/readiness`);
+    const host = getWorkerHost();
+    const healthResponse = await fetch(`http://${host}:${port}/api/readiness`);
     if (healthResponse.ok) {
       // Fetch context
       const contextResponse = await fetch(
-        `http://127.0.0.1:${port}/api/context/inject?project=${encodeURIComponent(projectName)}`
+        `http://${host}:${port}/api/context/inject?project=${encodeURIComponent(projectName)}`
       );
       if (contextResponse.ok) {
         const context = await contextResponse.text();
@@ -571,7 +533,7 @@ export function checkCursorHooksStatus(): number {
         const firstCommand = hooksContent?.hooks?.beforeSubmitPrompt?.[0]?.command || '';
 
         if (firstCommand.includes('worker-service.cjs') && firstCommand.includes('hook cursor')) {
-          console.log(`   Mode: Unified CLI (bun worker-service.cjs)`);
+          console.log(`   Mode: Unified CLI (node worker-service.cjs)`);
         } else {
           // Detect legacy shell scripts
           const bashScripts = ['session-init.sh', 'context-inject.sh', 'save-observation.sh'];
@@ -635,8 +597,8 @@ export async function detectClaudeCode(): Promise<boolean> {
     logger.debug('SYSTEM', 'Claude CLI not in PATH', {}, error as Error);
   }
 
-  // Check for Claude Code plugin directory (respects CLAUDE_CONFIG_DIR)
-  const pluginDir = path.join(CLAUDE_CONFIG_DIR, 'plugins');
+  // Check for Claude Code plugin directory
+  const pluginDir = path.join(homedir(), '.claude', 'plugins');
   if (existsSync(pluginDir)) {
     return true;
   }
